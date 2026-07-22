@@ -1,5 +1,6 @@
-//! Rendering. Two panels — the staging area (Changes) on the left and the
-//! commit history (Log) on the right — plus a bottom bar and modal popups.
+//! Rendering. Three panes — the staging area (Changes) and commit history
+//! (Log) stacked on the left, the diff pane on the right — plus a bottom bar
+//! and modal popups.
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -10,7 +11,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Focus, Mode};
-use crate::git::Section;
+use crate::git::{LineKind, Section};
 
 /// Border color for a panel: bright when focused, dim otherwise.
 fn border_style(focused: bool) -> Style {
@@ -31,17 +32,19 @@ fn panel(title: &str, focused: bool) -> Block<'_> {
 pub fn ui(frame: &mut Frame, app: &mut App) {
     // Outer: body + a feedback line + a legend.
     let outer = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(frame.area());
-    let body = Layout::horizontal([Constraint::Length(34), Constraint::Min(0)]).split(outer[0]);
+    let body =
+        Layout::horizontal([Constraint::Percentage(36), Constraint::Min(0)]).split(outer[0]);
+    let left = Layout::vertical([Constraint::Percentage(40), Constraint::Min(0)]).split(body[0]);
 
-    render_status(frame, app, body[0]);
-    render_log(frame, app, body[1]);
+    render_status(frame, app, left[0]);
+    render_log(frame, app, left[1]);
+    render_diff(frame, app, body[1]);
     render_status_bar(frame, app, outer[1]);
 
     // Popups draw on top of the body.
     match &app.mode {
         Mode::Normal => {}
         Mode::Input { .. } => render_input(frame, app, outer[0]),
-        Mode::Diff { .. } => render_diff(frame, app, outer[0]),
         Mode::Message(_) => render_message(frame, app, outer[0]),
     }
 }
@@ -150,6 +153,48 @@ fn log_title(app: &App) -> String {
     }
 }
 
+/// The diff pane: syntax-colored patch lines with a cursor and, while
+/// highlighting, a visibly selected range.
+fn render_diff(frame: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == Focus::Diff;
+    let sel = app.diff.selection();
+
+    let items: Vec<ListItem> = app
+        .diff
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let (marker, style) = match l.kind {
+                LineKind::Add => ("+", Style::new().fg(Color::Green)),
+                LineKind::Del => ("-", Style::new().fg(Color::Red)),
+                LineKind::Ctx => (" ", Style::new()),
+                LineKind::Hunk => ("", Style::new().fg(Color::Cyan)),
+                LineKind::File => ("", Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                LineKind::Meta => ("", Style::new().fg(Color::DarkGray)),
+                LineKind::Msg => ("", Style::new()),
+            };
+            let mut line = Line::from(Span::styled(format!("{marker}{}", l.text), style));
+            if sel.is_some_and(|(lo, hi)| i >= lo && i <= hi) {
+                line = line.style(Style::new().bg(Color::DarkGray));
+            }
+            ListItem::new(line)
+        })
+        .collect();
+
+    let mut title = format!("Diff: {}", app.diff.title);
+    if let Some((lo, hi)) = sel {
+        title.push_str(&format!("  [{} highlighted]", hi - lo + 1));
+    }
+
+    let list = List::new(items)
+        .block(panel(&title, focused))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+
+    app.diff.viewport = area.height.saturating_sub(2);
+    frame.render_stateful_widget(list, area, &mut app.diff.state);
+}
+
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let hdr = |name: &str, color: Color| {
         Span::styled(
@@ -169,19 +214,22 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Style::new().fg(Color::Black).bg(Color::Cyan),
     ));
 
-    // Line 2: general controls.
+    // Line 2: movement.
     let general = Line::from(vec![
-        hdr("General", Color::Cyan),
-        keys(" Tab switch panel · j/k ↑↓ move · r refresh · ? help · q quit"),
+        hdr("Panes", Color::Cyan),
+        keys(" ⇧H/J/K/L move · Tab cycle · j/k select · Enter diff · q/^C quit · ? help"),
     ]);
 
-    // Line 3: actions. Green ● = staged (committed), yellow ● = unstaged, magenta = origin.
+    // Line 3: actions.
     let actions = Line::from(vec![
-        hdr("Stage", Color::Green),
-        keys(" s/u stage · a all · c commit · d diff"),
+        hdr("Diff", Color::Blue),
+        keys(" ⇧Space highlight · s/u stage/unstage lines"),
+        gap(),
+        hdr("Files", Color::Green),
+        keys(" s/u/a stage · c commit"),
         gap(),
         hdr("Sync", Color::Magenta),
-        keys(" p/P/f push·pull·fetch"),
+        keys(" p/P/f"),
     ]);
 
     frame.render_widget(Paragraph::new(vec![feedback, general, actions]), area);
@@ -192,60 +240,40 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
-    let Mode::Input { buffer } = &app.mode else {
+    let Mode::Input { editor } = &app.mode else {
         return;
     };
     let staged = app.status.iter().filter(|e| e.section == Section::Staged).count();
 
-    let rect = centered_h(area, 70, 3);
-    frame.render_widget(Clear, rect);
-    let para = Paragraph::new(buffer.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(Color::Yellow))
-            .title(format!(
-                " Commit message — {staged} file(s) · Enter = commit · Esc = cancel "
-            )),
-    );
-    frame.render_widget(para, rect);
+    // The popup grows with the message (subject + body), within reason.
+    let body_h = (editor.lines.len() as u16).clamp(1, area.height.saturating_sub(6).max(1));
+    let rect = centered_h(area, 70, body_h + 2);
+    let inner_w = rect.width.saturating_sub(2).max(1);
+    let inner_h = rect.height.saturating_sub(2).max(1);
 
-    // Place the real terminal cursor after the typed text so it's clearly
-    // visible and blinks like any normal input field.
-    let max_x = rect.x + rect.width.saturating_sub(2);
-    let cursor_x = (rect.x + 1 + buffer.chars().count() as u16).min(max_x);
-    frame.set_cursor_position((cursor_x, rect.y + 1));
-}
+    // Scroll so the cursor always stays in view — long lines shift the text
+    // left instead of letting typing vanish past the border.
+    let cx = editor.display_col().min(u16::MAX as usize) as u16;
+    let cy = editor.row.min(u16::MAX as usize) as u16;
+    let scroll_x = cx.saturating_sub(inner_w - 1);
+    let scroll_y = cy.saturating_sub(inner_h - 1);
 
-fn render_diff(frame: &mut Frame, app: &App, area: Rect) {
-    let Mode::Diff { title, lines, scroll } = &app.mode else {
-        return;
-    };
-    let rect = centered(area, 90, 80);
     frame.render_widget(Clear, rect);
-    let styled: Vec<Line> = lines.iter().map(|l| diff_line(l)).collect();
-    let para = Paragraph::new(styled)
+    let text: Vec<Line> = editor.lines.iter().map(|l| Line::raw(l.clone())).collect();
+    let para = Paragraph::new(text)
+        .scroll((scroll_y, scroll_x))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::new().fg(Color::Cyan))
-                .title(format!(" {title}  (j/k scroll, q close) ")),
-        )
-        .scroll((*scroll, 0));
+                .border_style(Style::new().fg(Color::Yellow))
+                .title(format!(" Commit message — {staged} file(s) staged "))
+                .title_bottom(" Enter commit · Ctrl+N newline · Esc cancel "),
+        );
     frame.render_widget(para, rect);
-}
 
-/// Colorize a diff line by its leading marker.
-fn diff_line(l: &str) -> Line<'static> {
-    let style = match l.chars().next() {
-        Some('+') => Style::new().fg(Color::Green),
-        Some('-') => Style::new().fg(Color::Red),
-        _ if l.starts_with("@@") => Style::new().fg(Color::Cyan),
-        _ if l.starts_with("diff ") || l.starts_with("index ") => {
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
-        }
-        _ => Style::new(),
-    };
-    Line::from(Span::styled(l.to_string(), style))
+    // The real terminal cursor sits at the edit point, blinking like any
+    // normal input field.
+    frame.set_cursor_position((rect.x + 1 + cx - scroll_x, rect.y + 1 + cy - scroll_y));
 }
 
 fn render_message(frame: &mut Frame, app: &App, area: Rect) {
@@ -271,22 +299,6 @@ fn render_message(frame: &mut Frame, app: &App, area: Rect) {
 // Geometry helpers
 // ---------------------------------------------------------------------------
 
-/// A rectangle centered in `area`, sized as a percentage of width and height.
-fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
-    let v = Layout::vertical([
-        Constraint::Percentage((100 - pct_h) / 2),
-        Constraint::Percentage(pct_h),
-        Constraint::Percentage((100 - pct_h) / 2),
-    ])
-    .split(area);
-    Layout::horizontal([
-        Constraint::Percentage((100 - pct_w) / 2),
-        Constraint::Percentage(pct_w),
-        Constraint::Percentage((100 - pct_w) / 2),
-    ])
-    .split(v[1])[1]
-}
-
 /// Centered horizontally by percentage, with a fixed height in rows.
 fn centered_h(area: Rect, pct_w: u16, height: u16) -> Rect {
     let v = Layout::vertical([
@@ -306,40 +318,46 @@ fn centered_h(area: Rect, pct_w: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, Editor};
     use ratatui::{backend::TestBackend, Terminal};
 
-    /// Render every mode into a headless backend across a range of sizes; the
-    /// point is that layout math and popup sizing never panic.
+    /// Render every mode and focus into a headless backend across a range of
+    /// sizes; the point is that layout math and popup sizing never panic.
     #[test]
     fn renders_all_modes_without_panicking() {
         let mut app = App::load().expect("open repo");
 
         let make_modes = || {
+            // A long line (forces horizontal scroll) plus a multi-line body
+            // (forces vertical growth), cursor mid-text.
+            let editor = Editor {
+                lines: vec![
+                    "a commit subject long enough to scroll past a narrow popup border".into(),
+                    String::new(),
+                    "body line".into(),
+                ],
+                row: 2,
+                col: 4,
+            };
             vec![
                 Mode::Normal,
-                Mode::Input {
-                    buffer: "a commit message".to_string(),
-                },
-                Mode::Diff {
-                    title: "diff".to_string(),
-                    lines: vec!["@@ hunk".into(), "+added".into(), "-removed".into()],
-                    scroll: 1,
-                },
+                Mode::Input { editor },
                 Mode::Message("line1\nline2\nline3".to_string()),
             ]
         };
 
         for (w, h) in [(80u16, 24u16), (20, 8), (200, 60)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-            for mode in make_modes() {
-                app.mode = mode;
-                app.focus = if matches!(app.focus, Focus::Log) {
-                    Focus::Status
-                } else {
-                    Focus::Log
-                };
-                terminal.draw(|f| ui(f, &mut app)).expect("draw");
+            for focus in [Focus::Status, Focus::Log, Focus::Diff] {
+                app.set_focus(focus);
+                // Exercise the highlight path too.
+                app.diff.anchor = Some(0);
+                app.diff.jump(true);
+                for mode in make_modes() {
+                    app.mode = mode;
+                    terminal.draw(|f| ui(f, &mut app)).expect("draw");
+                }
+                app.diff.anchor = None;
             }
         }
     }

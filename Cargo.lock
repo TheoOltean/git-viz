@@ -464,6 +464,7 @@ dependencies = [
  "crossterm",
  "git2",
  "ratatui",
+ "unicode-width",
 ]
 
 [[package]]
